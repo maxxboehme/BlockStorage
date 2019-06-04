@@ -395,12 +395,9 @@ private:
          if (hasPrevBlockId(spaceTrackingBlock)) {
             Block<BlockSize> prevSpaceTrackingBlock = m_storage->at(static_cast<size_t>(prevBlockId(spaceTrackingBlock)));
             setNextBlockId(prevSpaceTrackingBlock, 0);
-         } else {
-            // If there is not a previous then we must be removing the last free block
-            getHeader()->freedBlocksBlockId = 0;
-         }
 
-         markAsFree(spaceTrackingBlock);
+            markAsFree(spaceTrackingBlock);
+         }
       }
 
       getHeader()->numFreeBlocks -= 1;
