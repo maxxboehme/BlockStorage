@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include "BlockStorage.h"
 #include <memory>
 #include <cstddef>
+
+#include <iostream>
 
 
 using RecordId = uint64_t;
@@ -21,7 +24,7 @@ public:
          std::lock_guard<BlockStorage<BlockSize> > lock(*m_storage);
 
          if (m_storage->size() == 0) {
-            Block headerBlock = m_storage->create();
+            Block<BlockSize> headerBlock = m_storage->create();
             assert(headerBlock.id() == HEADER_BLOCK);
 
             // Setting header
@@ -47,9 +50,9 @@ public:
    {
       std::vector<uint8_t> data;
 
-      std::vector<Block> blocks = findBlocks(recordId);
-      for (Block& block: blocks) {
-          data.insert(data.end(), block.data(), block.data() + block.size());
+      std::vector<Block<BlockSize> > blocks = findBlocks(recordId);
+      for (Block<BlockSize>& block: blocks) {
+          data.insert(data.end(), recordData(block), recordData(block) + recordDataSize(block));
       }
 
       return data;
@@ -57,11 +60,12 @@ public:
 
    RecordId add(const uint8_t* data, size_t size)
    {
-      std::vector<Block> blocks = getFreeBlocks(size);
+      std::cout << "add(data, size=" << size << ")" << std::endl;
+      std::vector<Block<BlockSize> > blocks = getFreeBlocks(size);
 
       const uint8_t* dataAddress = data;
-      size_t remainingSize = size;
-      for (Block& block : blocks) {
+      uint64_t remainingSize = static_cast<uint64_t>(size);
+      for (Block<BlockSize>& block : blocks) {
          uint64_t maxCapacity = block.capacity() - sizeof(RecordFormat);
          if (std::max(maxCapacity, remainingSize) == remainingSize) {
             std::vector<uint8_t> recordData = toRecordFormat(dataAddress, maxCapacity);
@@ -85,15 +89,47 @@ public:
 
    void erase(RecordId recordId)
    {
-      std::vector<Block> blocks = findBlocks(recordId);
-      markAsFree(blocks);
+      std::cout << "erase(recordId=" << recordId << ")" << std::endl;
+
+      std::vector<Block<BlockSize> > blocks = findBlocks(recordId);
+      for (Block<BlockSize> & block : blocks) {
+         markAsFree(block);
+      }
+
+      Header* header = getHeader();
+      header->size -= 1;
    }
 
    size_t size()
    {
-       return getHeader()->size;
+       // TODO: numeric_cast
+       return static_cast<size_t>(getHeader()->size);
    }
 
+   // TODO: just for testing
+   std::vector<uint64_t> getFreeBlockIds()
+   {
+      std::cout << "getFreeBlockIds()" << std::endl;
+
+      std::vector<uint64_t> freeBlockIds;
+
+      Block<BlockSize> spaceTrackingBlock = getSpaceTrackingBlock();
+      uint64_t* blockIds = reinterpret_cast<uint64_t*>(recordData(spaceTrackingBlock));
+      // TODO: numeric_cast
+      size_t size = static_cast<size_t>(recordDataSize(spaceTrackingBlock) / sizeof(uint64_t));
+      freeBlockIds.insert(freeBlockIds.end(), blockIds, blockIds + size);
+      while (hasNextBlockId(spaceTrackingBlock)) {
+         // TODO: numeric_cast
+         spaceTrackingBlock = m_storage->at(static_cast<size_t>(nextBlockId(spaceTrackingBlock)));
+
+         blockIds = reinterpret_cast<uint64_t*>(recordData(spaceTrackingBlock));
+         // TODO: numeric_cast
+         size = static_cast<size_t>(recordDataSize(spaceTrackingBlock) / sizeof(uint64_t));
+         freeBlockIds.insert(freeBlockIds.end(), blockIds, blockIds + size);
+      }
+
+      return freeBlockIds;
+   }
 
 private:
    static const uint64_t HEADER_BLOCK = 0;
@@ -108,62 +144,153 @@ private:
    };
 #pragma pack(pop)
 
-
-   static void initializeHeader(uint8_t* data)
-   {
-
-   }
-
 #pragma pack(push, 8)
    struct RecordFormat
    {
       uint64_t nextBlockId; // 8 bytes
-      uint64_t size;         // 8 bytes
-      uint8_t data[1];       // 1 byte
-                             // 7 bytes (padding)
+      uint64_t prevBlockId; // 8 bytes
+      uint8_t isFree;       // 1 bytes
+                            // 7 bytes (padding)
+      uint64_t size;        // 8 bytes
+      uint8_t data[1];      // 1 byte
+                            // 7 bytes (padding)
    };
 #pragma pack(pop)
 
-   static bool hasNextBlockId(const Block& block)
+   // TODO: should probably pass in size to validate
+   static void initializeHeader(uint8_t* data)
    {
-      RecordFormat* record = reinterpret_cast<RecordFormat*>(block.data());
-      return record->nextBlockId != 0;
+      std::memset(data, 0, sizeof(Header));
    }
 
-   static uint64_t nextBlockId(const Block& block)
+   // TODO: should probably pass in size to validate
+   static void initializeRecordFormat(uint8_t* data)
    {
-      RecordFormat* record = reinterpret_cast<RecordFormat*>(block.data());
+      std::memset(data, 0, sizeof(RecordFormat));
+   }
+
+   static void initializeRecordFormat(Block<BlockSize>& block)
+   {
+       initializeRecordFormat(block.data());
+   }
+
+
+   static RecordFormat* getRecordFormat(Block<BlockSize>& block)
+   {
+      return reinterpret_cast<RecordFormat*>(block.data());
+   }
+
+   static bool hasNextBlockId(const Block<BlockSize>& block)
+   {
+      const RecordFormat* record = reinterpret_cast<const RecordFormat*>(block.data());
+      return record->nextBlockId != kInvalidRecordId;
+   }
+
+   static uint64_t nextBlockId(const Block<BlockSize>& block)
+   {
+      const RecordFormat* record = reinterpret_cast<const RecordFormat*>(block.data());
       return record->nextBlockId;
    }
 
-   static uint64_t recordCapacity(const Block& block)
+   static void setNextBlockId(Block<BlockSize>& block, uint64_t blockId)
+   {
+      RecordFormat* record = reinterpret_cast<RecordFormat*>(block.data());
+      record->nextBlockId = blockId;
+   }
+
+   static bool hasPrevBlockId(const Block<BlockSize>& block)
+   {
+      const RecordFormat* record = reinterpret_cast<const RecordFormat*>(block.data());
+      return record->prevBlockId != kInvalidRecordId;
+   }
+
+   static uint64_t prevBlockId(const Block<BlockSize>& block)
+   {
+      const RecordFormat* record = reinterpret_cast<const RecordFormat*>(block.data());
+      return record->prevBlockId;
+   }
+
+   static void setPrevBlockId(Block<BlockSize>& block, uint64_t blockId)
+   {
+      RecordFormat* record = reinterpret_cast<RecordFormat*>(block.data());
+      record->prevBlockId = blockId;
+   }
+
+
+   static bool isRecordFree(const Block<BlockSize>& block)
+   {
+      const RecordFormat* record = reinterpret_cast<const RecordFormat*>(block.data());
+      return !!record->isFree;
+   }
+
+   static void setRecordFree(Block<BlockSize>& block, bool isFree)
+   {
+      RecordFormat* record = reinterpret_cast<RecordFormat*>(block.data());
+      record->isFree = isFree;
+   }
+
+   static uint64_t recordCapacity(const Block<BlockSize>& block)
    {
       return block.capacity() - offsetof(RecordFormat, data);
    }
 
-   static uint64_t recordDataSize(const Block& block)
+   static uint64_t recordDataSize(const Block<BlockSize>& block)
    {
-      RecordFormat* record = reinterpret_cast<RecordFormat*>(block.data());
+      const RecordFormat* record = reinterpret_cast<const RecordFormat*>(block.data());
       return record->size;
    }
 
-   static uint8_t* recordData(const Block& block)
+   static const uint8_t* recordData(const Block<BlockSize>& block)
+   {
+      const RecordFormat* record = reinterpret_cast<const RecordFormat*>(block.data());
+      return record->data;
+   }
+
+   static uint8_t* recordData(Block<BlockSize>& block)
    {
       RecordFormat* record = reinterpret_cast<RecordFormat*>(block.data());
       return record->data;
    }
 
+
+   static void recordDataAppend(Block<BlockSize>& block, uint8_t* data, size_t size)
+   {
+      if (recordCapacity(block) < recordDataSize(block) + size) {
+         // TODO: throw
+      }
+
+      uint8_t* address = recordData(block) + recordDataSize(block);
+      std::memcpy(address, data, size);
+      RecordFormat* recordFormat = getRecordFormat(block);
+      recordFormat->size += size;
+   }
+
+   static void recordDataPop(Block<BlockSize>& block, uint8_t* data, size_t size)
+   {
+      if (recordDataSize(block) < size) {
+         // TODO: throw
+      }
+
+      uint8_t* address = recordData(block) + recordDataSize(block) - size;
+      std::memcpy(data, address, size);
+      RecordFormat* recordFormat = getRecordFormat(block);
+      recordFormat->size -= size;
+   }
+
+
    std::unique_ptr<BlockStorage<BlockSize> > sorage;
 
-   std::vector<Block> findBlocks(RecordId recordId)
+   std::vector<Block<BlockSize> > findBlocks(RecordId recordId)
    {
-      std::vector<Block> blocks;
+      std::vector<Block<BlockSize> > blocks;
 
-      Block block = m_storage->at(recordId);
+      // TODO: numeric_cast
+      Block<BlockSize> block = m_storage->at(static_cast<size_t>(recordId));
       RecordFormat* recordHeader = reinterpret_cast<RecordFormat*>(block.data());
       blocks.push_back(block);
-      while ((recordId = recordHeader->nextBlockId) != 0) {
-         Block block = m_storage->at(recordId);
+      while ((recordId = recordHeader->nextBlockId) != kInvalidRecordId) {
+         // TODO: numeric_cast
+         Block<BlockSize> block = m_storage->at(static_cast<size_t>(recordId));
          recordHeader = reinterpret_cast<RecordFormat*>(block.data());
          blocks.push_back(block);
       }
@@ -171,7 +298,7 @@ private:
       return blocks;
    }
 
-   std::vector<uint8_t> toRecordFormat(const uint8_t* data, size_t size)
+   std::vector<uint8_t> toRecordFormat(const uint8_t* data, uint64_t size)
    {
       // TODO: numeric_cast
       uint32_t dataSizeInBytes = static_cast<uint32_t>(offsetof(RecordFormat, data) + size);
@@ -179,58 +306,122 @@ private:
       std::vector<uint8_t> result(dataSizeInBytes);
 
       RecordFormat* record = reinterpret_cast<RecordFormat*>(result.data());
-      record->nextBlockId = 0;
+      record->nextBlockId = kInvalidRecordId;
       record->size = size;
-      memcpy(record->data, data, size);
+      // TODO: numeric_cast
+      memcpy(record->data, data, static_cast<size_t>(size));
 
       return result;
    }
 
    Header* getHeader()
    {
-      Block headerBlock = m_storage->at(HEADER_BLOCK);
+      Block<BlockSize> headerBlock = m_storage->at(HEADER_BLOCK);
       return reinterpret_cast<Header*>(headerBlock.data());
    }
 
-   Block getSpaceTrackingBlock()
+   Block<BlockSize> getSpaceTrackingBlock()
    {
-      Header* header = getHeader();
-      if (header->freedBlocksBlockId == 0) {
-         Block block = m_storage->create();
-         header->freedBlockBlockId = block.id();
+      std::cout << "getSpaceTrackingBlock()" << std::endl;
+
+      if (getHeader()->freedBlocksBlockId == 0) {
+         Block<BlockSize> block = m_storage->create();
+         initializeRecordFormat(block);
+
+         std::cout << "Creating Space Tracking block: id=" << block.id() << std::endl;
+         getHeader()->freedBlocksBlockId = block.id();
+         std::cout << "Returning Space Tracking block: id=" << getHeader()->freedBlocksBlockId << std::endl;
          return block;
       } else {
-         return m_storage->at(header->freedBlocksBlockId);
+         std::cout << "Returning Space Tracking block: id=" << getHeader()->freedBlocksBlockId << std::endl;
+         // TODO: numeric_cast
+         return m_storage->at(static_cast<size_t>(getHeader()->freedBlocksBlockId));
       }
    }
 
-   void markAsFree(Block& block)
+   void markAsFree(Block<BlockSize>& block)
    {
-      Block spaceTrackingBlock = getSpaceTrackingBlock();
+      std::cout << "markAsFree(block: id=" << block.id() << ")" << std::endl;
+      Block<BlockSize> spaceTrackingBlock = getSpaceTrackingBlock();
       while (hasNextBlockId(spaceTrackingBlock)) {
-         spaceTrackingBlock = m_storage->at(nextBlockId(spaceTrackingBlock));
+         // TODO: numeric_cast
+         spaceTrackingBlock = m_storage->at(static_cast<size_t>(nextBlockId(spaceTrackingBlock)));
       }
 
-      size_t neededSize = recordDataSize(spaceTrackingBlock) + sizeof(uint64_t);
+      // TODO: numeric_cast
+      size_t neededSize = static_cast<size_t>(recordDataSize(spaceTrackingBlock) + sizeof(uint64_t));
       if (neededSize > recordCapacity(spaceTrackingBlock)) {
+         Block<BlockSize> newSpaceTrackingBlock = m_storage->create();
+         initializeRecordFormat(newSpaceTrackingBlock);
+         setPrevBlockId(newSpaceTrackingBlock, spaceTrackingBlock.id());
+
+         setNextBlockId(spaceTrackingBlock, newSpaceTrackingBlock.id());
+
+         uint64_t blockId = block.id();
+         recordDataAppend(newSpaceTrackingBlock, reinterpret_cast<uint8_t*>(&blockId), sizeof(uint64_t));
       } else {
+         std::cout << "Appending Free block: id=" << block.id() << std::endl;
+         std::cout << "   Block size before: size=" << recordDataSize(spaceTrackingBlock) << std::endl;
+         uint64_t blockId = block.id();
+         recordDataAppend(spaceTrackingBlock, reinterpret_cast<uint8_t*>(&blockId), sizeof(uint64_t));
+         std::cout << "   Block size after: size=" << recordDataSize(spaceTrackingBlock) << std::endl;
       }
 
+      setRecordFree(block, true);
 
-
-      Header* header = getHeader();
-      header->numFreeBlocks -= 1;
+      getHeader()->numFreeBlocks += 1;
    }
 
-   std::vector<Block> getFreeBlocks(size_t size)
+   Block<BlockSize> popFreeBlock()
    {
-       std::vector<Block> blocks;
+      std::cout << "popFreeBlock" << std::endl;
+      if (getHeader()->numFreeBlocks == 0) {
+         // TODO: throw exception
+      }
+
+      Block<BlockSize> spaceTrackingBlock = getSpaceTrackingBlock();
+      while (hasNextBlockId(spaceTrackingBlock)) {
+         // TODO: numeric_cast
+         spaceTrackingBlock = m_storage->at(static_cast<size_t>(nextBlockId(spaceTrackingBlock)));
+      }
+
+      uint64_t freeBlockId = kInvalidRecordId;
+      std::cout << "   Block size before: size=" << recordDataSize(spaceTrackingBlock) << std::endl;
+      recordDataPop(spaceTrackingBlock, reinterpret_cast<uint8_t*>(&freeBlockId), sizeof(uint64_t));
+      std::cout << "   Block size after: size=" << recordDataSize(spaceTrackingBlock) << std::endl;
+
+      // Check if that spaceTrackingBlock is empty. If so we should free it.
+      if (recordDataSize(spaceTrackingBlock) == 0) {
+         if (hasPrevBlockId(spaceTrackingBlock)) {
+            Block<BlockSize> prevSpaceTrackingBlock = m_storage->at(static_cast<size_t>(prevBlockId(spaceTrackingBlock)));
+            setNextBlockId(prevSpaceTrackingBlock, 0);
+         } else {
+            // If there is not a previous then we must be removing the last free block
+            getHeader()->freedBlocksBlockId = 0;
+         }
+
+         markAsFree(spaceTrackingBlock);
+      }
+
+      getHeader()->numFreeBlocks -= 1;
+      return m_storage->at(static_cast<size_t>(freeBlockId));
+   }
+
+   std::vector<Block<BlockSize> > getFreeBlocks(size_t size)
+   {
+       std::cout << "getFreeBlocks(size=" << size << ")" << std::endl;
+       std::vector<Block<BlockSize> > blocks;
 
        size_t remainder = size % BlockSize == 0 ? 0 : 1;
        size_t numBlocks = (size / BlockSize) + remainder;
 
-       // TODO: Look in freed blocks first
        blocks.reserve(numBlocks);
+
+       while (numBlocks > 0 && getHeader()->numFreeBlocks > 0) {
+          blocks.push_back(popFreeBlock());
+          --numBlocks;
+       }
+
        for (size_t i = 0; i < numBlocks; ++i) {
            blocks.push_back(m_storage->create());
        }
